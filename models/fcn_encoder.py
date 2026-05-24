@@ -35,15 +35,19 @@ class ConvWide(nn.Module):
         return x
 
 class ConvMultiScale(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    # 增加 stride 参数，默认设为 4 (如果你希望降维更快，可以设为 2)
+    def __init__(self, in_channels, out_channels, stride=4):
         super(ConvMultiScale, self).__init__()
         if out_channels % 4 != 0:
             raise ValueError('out_channels should be divisible by 4')
         mid_channels = out_channels // 4
-        self.conv1 = nn.Conv1d(in_channels, mid_channels, 1, 1, padding=0)
-        self.conv3 = nn.Conv1d(in_channels, mid_channels, 3, 1, padding=1)
-        self.conv5 = nn.Conv1d(in_channels, mid_channels, 5, 1, padding=2)
-        self.conv7 = nn.Conv1d(in_channels, mid_channels, 7, 1, padding=3)
+        
+        # 将 stride 应用到所有卷积分支
+        self.conv1 = nn.Conv1d(in_channels, mid_channels, 1, stride=stride, padding=0)
+        self.conv3 = nn.Conv1d(in_channels, mid_channels, 3, stride=stride, padding=1)
+        self.conv5 = nn.Conv1d(in_channels, mid_channels, 5, stride=stride, padding=2)
+        self.conv7 = nn.Conv1d(in_channels, mid_channels, 7, stride=stride, padding=3)
+        
         self.norm = nn.BatchNorm1d(mid_channels * 3)
         self.relu = nn.ReLU()
         self.ca = ChannelAttention(mid_channels * 3)
@@ -63,12 +67,16 @@ class ConvMultiScale(nn.Module):
         return out
 
 class GMPFM(nn.Module):
-    def __init__(self, in_channels=128):
+    def __init__(self, in_channels=128, stride=1): # 默认 stride=1
         super(GMPFM, self).__init__()
-        # 多尺度分支：每个分支输出 32 通道，总共 96 通道
-        self.conv_k3 = nn.Conv1d(in_channels, 32, kernel_size=3, padding=1)
-        self.conv_k5 = nn.Conv1d(in_channels, 32, kernel_size=5, padding=2)
-        self.conv_k7 = nn.Conv1d(in_channels, 32, kernel_size=7, padding=3)
+        self.stride = stride
+        
+        # 卷积分支
+        self.conv_k3 = nn.Conv1d(in_channels, 32, kernel_size=3, stride=stride, padding=1)
+        self.conv_k5 = nn.Conv1d(in_channels, 32, kernel_size=5, stride=stride, padding=2)
+        self.conv_k7 = nn.Conv1d(in_channels, 32, kernel_size=7, stride=stride, padding=3)
+        
+        
         
         self.gate = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
@@ -83,36 +91,51 @@ class GMPFM(nn.Module):
         self.bn = nn.BatchNorm1d(128) 
 
     def forward(self, x):
-        # x: (Batch, 128, L)
+        # f3, f5, f7 经过了卷积层，长度由 stride 决定
         f3 = F.relu(self.conv_k3(x))
         f5 = F.relu(self.conv_k5(x))
         f7 = F.relu(self.conv_k7(x))
         
-        weights = self.gate(x).unsqueeze(-1) # (Batch, 3, 1)
+        # gate_weights 计算的是全局上下文，不需要考虑 stride
+        gate_weights = self.gate(x) 
+        self.last_lambda = gate_weights
+        weights = gate_weights.unsqueeze(-1) 
         
-        # 融合后的特征维度是 (Batch, 32, L)
+        # 融合逻辑
         fused = weights[:, 0:1, :] * f3 + weights[:, 1:2, :] * f5 + weights[:, 2:3, :] * f7
         
-        # 为了凑够 128 维：
-        # 融合特征 32 维 + 原始特征 96 维 = 128 维
-        out = torch.cat([fused, x[:, 32:, :]], dim=1) 
+        # ========================================================
+        # ⚠️ 维度匹配的核心点：
+        # 如果 fused 因为 stride > 1 变短了，这里的 x[:, 32:, :] 也必须同样变短
+        # ========================================================
+        if self.stride > 1:
+            # 同样使用和卷积层一样的下采样方式 (这里用 MaxPool1d 模拟)
+            residual = F.max_pool1d(x[:, 32:, :], kernel_size=self.stride, stride=self.stride)
+        else:
+            residual = x[:, 32:, :]
+            
+        out = torch.cat([fused, residual], dim=1) 
         
         return self.bn(out)
 
 class FCN_Encoder(nn.Module):
     def __init__(self):
         super(FCN_Encoder, self).__init__()
-        # 初始特征提取 [cite: 254]
         self.conv_in = ConvWide(1, 128, kernel_size=8, stride=8) 
         
-        # 递进式结构：前两层 MSCAB，第三层替换为 GMPFM [cite: 254]
-        self.mscab1 = ConvMultiScale(128, 128)
-        self.mscab2 = ConvMultiScale(128, 128)
-        self.gmpfm = GMPFM(in_channels=128)
+        # 每层都进行 4 倍下采样
+        self.mscab1 = ConvMultiScale(128, 128, stride=4)
+        self.mscab2 = ConvMultiScale(128, 128, stride=4)
+        # 如果你希望在 GMPFM 也下采样，可以仿照上面的逻辑修改 GMPFM 类
+        self.gmpfm = GMPFM(in_channels=128, stride=4) # 显式传入 stride=4 
 
     def forward(self, x):
         x = self.conv_in(x)
+       # print(f"Shape after conv_in: {x.shape}") # 应该输出 [B, 128, 3000]
         x = self.mscab1(x)
+       # print(f"Shape after mscab1: {x.shape}")  # 应该输出 [B, 128, 750]
         x = self.mscab2(x)
+       # print(f"Shape after mscab2: {x.shape}")  # 应该输出 [B, 128, 188]
         x = self.gmpfm(x)
+       # print(f"Shape after gmpfm: {x.shape}")   # 应该输出 [B, 128, 47]
         return x
